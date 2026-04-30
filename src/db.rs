@@ -708,6 +708,8 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
     let mut last_reported = 0usize;
     const REPORT_INTERVAL: usize = 1_000;
 
+    metrics::gauge!("indexing_in_progress").set(1.0);
+
     let atomic_ok = db.begin_atomic().is_ok();
     if !atomic_ok {
         warn!("begin_atomic failed; falling back to unbatched indexing");
@@ -723,14 +725,17 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
             if s.contains("/cur/") || s.contains("/new/") {
                 if let Err(e) = db.index_file(path, None) {
                     warn!("Failed to index {path:?}: {e}");
+                    metrics::counter!("indexing_errors_total").increment(1);
                 } else {
                     indexed += 1;
+                    metrics::counter!("indexing_documents_total").increment(1);
                     if indexed - last_reported >= REPORT_INTERVAL {
+                        let rate = indexing_rate(indexed, &start);
                         info!(
                             "Indexed {} messages ({:.0} msg/s)...",
-                            indexed,
-                            indexing_rate(indexed, &start)
+                            indexed, rate
                         );
+                        metrics::gauge!("indexing_rate").set(rate);
                         last_reported = indexed;
                     }
                 }
@@ -747,11 +752,16 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
         warn!("Final close failed: {e}");
     }
 
+    let final_rate = indexing_rate(indexed, &start);
+    metrics::gauge!("indexing_in_progress").set(0.0);
+    metrics::gauge!("indexing_rate").set(final_rate);
+    metrics::counter!("indexing_documents_total").absolute(indexed as u64);
+
     info!(
         "Indexed {} messages in {:.1}s ({:.0} msg/s)",
         indexed,
         start.elapsed().as_secs_f64(),
-        indexing_rate(indexed, &start)
+        final_rate
     );
 }
 
