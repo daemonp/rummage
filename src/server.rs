@@ -8,6 +8,7 @@ use crate::ui::thread::ThreadPage;
 use crate::ui::{render_page, AppShell, Header, SidebarRow, Subheader};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::header::COOKIE;
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -48,6 +49,22 @@ fn theme_from_cookies(headers: &axum::http::HeaderMap) -> &'static str {
 /// is listening.  Does not touch the database, so it works during indexing.
 async fn health_handler() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Readiness probe endpoint. Returns 200 only when the database is ready
+/// to serve requests; returns 503 while initialization is in progress.
+async fn ready_handler(State(db): State<DbHandle>) -> impl IntoResponse {
+    if db.is_ready() {
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "ready"})),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"status": "not ready"})),
+        )
+    }
 }
 
 /// Start the Axum HTTP server on the given host and port.
@@ -134,6 +151,7 @@ async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
     let mut router = Router::new()
         // JSON API routes — always present
         .route("/api/health", get(health_handler))
+        .route("/api/ready", get(ready_handler))
         .route("/api/search", get(api::search::handler))
         .route("/api/thread/:id", get(api::thread::handler))
         .route("/api/attachment", get(api::attachment::handler))
@@ -360,4 +378,31 @@ async fn thread_handler(
         },
         theme,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbHandle;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn test_health_handler_returns_ok() {
+        let response = health_handler().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_ready_handler_when_db_ready() {
+        let (db, _) = DbHandle::mock(false);
+        let response = ready_handler(State(db)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_ready_handler_when_db_initializing() {
+        let (db, _) = DbHandle::mock(true);
+        let response = ready_handler(State(db)).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

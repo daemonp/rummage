@@ -99,9 +99,9 @@ impl DbHandle {
         &self,
         make_req: impl FnOnce(oneshot::Sender<Result<T>>) -> DbRequest,
     ) -> Result<T> {
-        match self.state.borrow().clone() {
+        match &*self.state.borrow() {
             DbState::Ready => {}
-            DbState::Failed(ref e) => {
+            DbState::Failed(e) => {
                 return Err(AppError::ServiceUnavailable(e.clone()));
             }
             DbState::Initializing => {
@@ -225,15 +225,20 @@ impl DbHandle {
     pub async fn wait_for_ready(&self) -> Result<()> {
         let mut rx = self.state.clone();
         loop {
-            match rx.borrow().clone() {
+            match &*rx.borrow() {
                 DbState::Ready => return Ok(()),
-                DbState::Failed(ref e) => return Err(AppError::ServiceUnavailable(e.clone())),
+                DbState::Failed(e) => return Err(AppError::ServiceUnavailable(e.clone())),
                 DbState::Initializing => {}
             }
             if rx.changed().await.is_err() {
                 return Err(AppError::Internal("DB worker dropped state channel".into()));
             }
         }
+    }
+
+    /// Returns `true` if the database worker is ready to serve requests.
+    pub fn is_ready(&self) -> bool {
+        matches!(&*self.state.borrow(), DbState::Ready)
     }
 
     /// Extract attachment text (stub).
@@ -471,6 +476,26 @@ pub async fn spawn_database_worker(
     })
 }
 
+#[cfg(test)]
+impl DbHandle {
+    /// Build a mock handle for tests with a specific initial state.
+    pub fn mock(initializing: bool) -> (Self, watch::Sender<DbState>) {
+        let (sender, _) = mpsc::channel(32);
+        let (state_tx, state_rx) = watch::channel(if initializing {
+            DbState::Initializing
+        } else {
+            DbState::Ready
+        });
+        (
+            DbHandle {
+                sender,
+                state: state_rx,
+            },
+            state_tx,
+        )
+    }
+}
+
 /// Force a full re-index of the maildir, then exit.
 ///
 /// # Errors
@@ -512,6 +537,16 @@ fn create_and_index(maildir: &Path, config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Calculate average indexing rate since `start`.
+fn indexing_rate(indexed: usize, start: &std::time::Instant) -> f64 {
+    let elapsed = start.elapsed().as_secs_f64();
+    if elapsed > 0.0 {
+        indexed as f64 / elapsed
+    } else {
+        0.0
+    }
+}
+
 fn index_maildir(db: &notmuch::Database, maildir: &Path) {
     info!("Walking maildir for indexing...");
     let start = std::time::Instant::now();
@@ -533,13 +568,11 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
                 } else {
                     indexed += 1;
                     if indexed - last_reported >= REPORT_INTERVAL {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        let rate = if elapsed > 0.0 {
-                            indexed as f64 / elapsed
-                        } else {
-                            0.0
-                        };
-                        info!("Indexed {} messages ({:.0} msg/s)...", indexed, rate);
+                        info!(
+                            "Indexed {} messages ({:.0} msg/s)...",
+                            indexed,
+                            indexing_rate(indexed, &start)
+                        );
                         last_reported = indexed;
                     }
                 }
@@ -547,14 +580,10 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
         }
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let rate = if elapsed > 0.0 {
-        indexed as f64 / elapsed
-    } else {
-        0.0
-    };
     info!(
         "Indexed {} messages in {:.1}s ({:.0} msg/s)",
-        indexed, elapsed, rate
+        indexed,
+        start.elapsed().as_secs_f64(),
+        indexing_rate(indexed, &start)
     );
 }
