@@ -325,9 +325,7 @@ fn dispatch(db: &notmuch::Database, req: DbRequest) {
             part_num,
             respond,
         } => {
-            let _ = respond.send(crate::api::attachment::do_attachment(
-                db, &msg_id, part_num,
-            ));
+            let _ = respond.send(crate::api::attachment::do_attachment(db, &msg_id, part_num));
         }
         DbRequest::RawMessage { msg_id, respond } => {
             let _ = respond.send(crate::api::message::do_raw_message(db, &msg_id));
