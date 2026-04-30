@@ -84,6 +84,17 @@ docker run -p 8000:8000 \
   -v ~/.notmuch:/notmuch \
   -e NOTMUCH_CONFIG=/notmuch/notmuch-config \
   rummage
+
+# Full production settings
+docker run -d --name rummage -p 8000:8000 \
+  -v /data/email:/mail \
+  -v $(pwd)/notmuch-config:/notmuch:ro \
+  -e RUMMAGE_MAILDIR=/mail \
+  -e RUMMAGE_HOST=0.0.0.0 \
+  -e RUMMAGE_PORT=8000 \
+  -e NOTMUCH_CONFIG=/notmuch/notmuch-config \
+  -e RUMMAGE_MCP_ALLOWED_HOSTS=email-archive.myawesomehouse.com \
+  ghcr.io/daemonp/rummage:master
 ```
 
 **Volumes:**
@@ -100,6 +111,7 @@ docker run -p 8000:8000 \
 | `RUMMAGE_PORT` | `8000` | Listen port |
 | `NOTMUCH_CONFIG` | `/notmuch/notmuch-config` | Standard notmuch config path (optional) |
 | `RUMMAGE_NOTMUCH_CONFIG` | — | Rummage-specific override (optional) |
+| `RUMMAGE_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Allowed `Host` headers for MCP DNS rebinding protection |
 
 > **Note:** Notmuch stores its database inside the maildir tree (`maildir/.notmuch/`).  There is no separate `database_path` option — this is a notmuch convention.  If you mount the maildir read-only, auto-initialization will fail; either mount it read-write or pre-build the index locally.
 
@@ -193,6 +205,7 @@ Rummage reads configuration from command-line flags and environment variables. A
 | `--no-auto-index` | — | — | Skip auto-initialization |
 | `--no-webui` | — | false | Disable HTML routes and static assets |
 | `--no-mcp` | — | false | Disable MCP transport at `/mcp` |
+| `--mcp-allowed-hosts` | `RUMMAGE_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Comma-separated allowed Host headers for MCP (reverse-proxy safety) |
 
 ---
 
