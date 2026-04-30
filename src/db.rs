@@ -374,7 +374,11 @@ pub async fn spawn_database_worker(
                     limit,
                     respond,
                 } => {
-                    let _ = respond.send(crate::api::senders::do_senders_with_query(&db, query.as_deref(), limit));
+                    let _ = respond.send(crate::api::senders::do_senders_with_query(
+                        &db,
+                        query.as_deref(),
+                        limit,
+                    ));
                 }
                 DbRequest::ThreadTree { thread_id, respond } => {
                     let _ = respond.send(crate::api::thread::do_thread_tree(&db, &thread_id));
@@ -385,7 +389,9 @@ pub async fn spawn_database_worker(
                     format,
                     respond,
                 } => {
-                    let _ = respond.send(crate::api::attachment::do_attachment_text(&db, &msg_id, part, &format));
+                    let _ = respond.send(crate::api::attachment::do_attachment_text(
+                        &db, &msg_id, part, &format,
+                    ));
                 }
             }
         }
