@@ -1,0 +1,16 @@
+target/
+.git/
+.gitignore
+mail/
+contrib/
+.github/
+*.md
+!README.md
+Dockerfile*
+.dockerignore
+.env
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

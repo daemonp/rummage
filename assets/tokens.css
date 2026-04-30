@@ -1,0 +1,293 @@
+/* Rummage — shared design tokens */
+/* Three direction themes, each with light + dark variants */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; }
+body { font-family: var(--font-sans); color: var(--fg); background: var(--bg); -webkit-font-smoothing: antialiased; }
+
+/* =========================
+   Direction A — Instrument
+   ========================= */
+.theme-instrument {
+  --font-sans: 'Inter Tight', -apple-system, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  --font-display: 'Inter Tight', sans-serif;
+  --radius: 4px;
+  --radius-lg: 8px;
+}
+.theme-instrument.dark {
+  --bg:        oklch(0.18 0.005 250);
+  --bg-2:      oklch(0.21 0.005 250);
+  --bg-3:      oklch(0.24 0.006 250);
+  --bg-elev:   oklch(0.235 0.006 250);
+  --fg:        oklch(0.96 0.005 250);
+  --fg-2:      oklch(0.78 0.008 250);
+  --fg-3:      oklch(0.55 0.012 250);
+  --fg-4:      oklch(0.40 0.012 250);
+  --line:      oklch(0.30 0.008 250);
+  --line-2:    oklch(0.26 0.007 250);
+  --accent:    oklch(0.82 0.13 215);
+  --accent-2:  oklch(0.78 0.13 215);
+  --accent-fg: oklch(0.18 0.005 250);
+  --warn:      oklch(0.78 0.14 75);
+  --good:      oklch(0.78 0.14 155);
+  --bad:       oklch(0.72 0.18 25);
+  --shadow:    0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 24px rgba(0,0,0,0.4);
+}
+.theme-instrument.light {
+  --bg:        oklch(0.985 0.002 90);
+  --bg-2:      oklch(0.965 0.003 90);
+  --bg-3:      oklch(0.945 0.004 90);
+  --bg-elev:   oklch(1 0 0);
+  --fg:        oklch(0.20 0.005 250);
+  --fg-2:      oklch(0.40 0.008 250);
+  --fg-3:      oklch(0.55 0.010 250);
+  --fg-4:      oklch(0.68 0.010 250);
+  --line:      oklch(0.88 0.006 250);
+  --line-2:    oklch(0.92 0.005 250);
+  --accent:    oklch(0.55 0.16 220);
+  --accent-2:  oklch(0.50 0.18 220);
+  --accent-fg: oklch(0.985 0.002 90);
+  --warn:      oklch(0.62 0.16 70);
+  --good:      oklch(0.55 0.14 155);
+  --bad:       oklch(0.55 0.20 25);
+  --shadow:    0 1px 0 rgba(0,0,0,0.02) inset, 0 8px 24px rgba(0,0,0,0.06);
+}
+
+/* =========================
+   Direction B — Spool (editorial)
+   ========================= */
+.theme-spool {
+  --font-sans: 'Inter Tight', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-display: 'Newsreader', Georgia, serif;
+  --radius: 2px;
+  --radius-lg: 4px;
+}
+.theme-spool.dark {
+  --bg:        oklch(0.20 0.008 60);
+  --bg-2:      oklch(0.23 0.009 60);
+  --bg-3:      oklch(0.26 0.010 60);
+  --bg-elev:   oklch(0.245 0.010 60);
+  --fg:        oklch(0.96 0.010 80);
+  --fg-2:      oklch(0.80 0.012 75);
+  --fg-3:      oklch(0.58 0.015 70);
+  --fg-4:      oklch(0.42 0.015 65);
+  --line:      oklch(0.32 0.012 60);
+  --line-2:    oklch(0.28 0.010 60);
+  --accent:    oklch(0.80 0.12 60);
+  --accent-2:  oklch(0.74 0.14 50);
+  --accent-fg: oklch(0.20 0.008 60);
+  --warn:      oklch(0.78 0.14 75);
+  --good:      oklch(0.78 0.12 145);
+  --bad:       oklch(0.70 0.18 25);
+  --shadow:    0 8px 24px rgba(0,0,0,0.45);
+}
+.theme-spool.light {
+  --bg:        oklch(0.975 0.010 80);
+  --bg-2:      oklch(0.955 0.012 80);
+  --bg-3:      oklch(0.93 0.014 75);
+  --bg-elev:   oklch(0.99 0.005 80);
+  --fg:        oklch(0.22 0.012 60);
+  --fg-2:      oklch(0.42 0.014 60);
+  --fg-3:      oklch(0.55 0.016 60);
+  --fg-4:      oklch(0.66 0.016 60);
+  --line:      oklch(0.85 0.014 70);
+  --line-2:    oklch(0.90 0.012 75);
+  --accent:    oklch(0.50 0.16 50);
+  --accent-2:  oklch(0.46 0.18 45);
+  --accent-fg: oklch(0.975 0.010 80);
+  --warn:      oklch(0.60 0.16 70);
+  --good:      oklch(0.50 0.14 145);
+  --bad:       oklch(0.55 0.20 25);
+  --shadow:    0 8px 24px rgba(0,0,0,0.06);
+}
+
+/* =========================
+   Direction C — Console
+   ========================= */
+.theme-console {
+  --font-sans: 'JetBrains Mono', ui-monospace, monospace;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-display: 'JetBrains Mono', monospace;
+  --radius: 0px;
+  --radius-lg: 0px;
+}
+.theme-console.dark {
+  --bg:        oklch(0.16 0.004 250);
+  --bg-2:      oklch(0.19 0.004 250);
+  --bg-3:      oklch(0.22 0.005 250);
+  --bg-elev:   oklch(0.21 0.005 250);
+  --fg:        oklch(0.92 0.004 130);
+  --fg-2:      oklch(0.72 0.010 130);
+  --fg-3:      oklch(0.50 0.012 130);
+  --fg-4:      oklch(0.36 0.010 130);
+  --line:      oklch(0.28 0.006 250);
+  --line-2:    oklch(0.24 0.005 250);
+  --accent:    oklch(0.86 0.18 145);
+  --accent-2:  oklch(0.80 0.20 145);
+  --accent-fg: oklch(0.14 0.004 250);
+  --warn:      oklch(0.85 0.16 85);
+  --good:      oklch(0.86 0.18 145);
+  --bad:       oklch(0.74 0.20 22);
+  --shadow:    0 0 0 1px rgba(255,255,255,0.04) inset;
+}
+.theme-console.light {
+  --bg:        oklch(0.98 0.003 130);
+  --bg-2:      oklch(0.95 0.004 130);
+  --bg-3:      oklch(0.92 0.005 130);
+  --bg-elev:   oklch(1 0 0);
+  --fg:        oklch(0.20 0.005 250);
+  --fg-2:      oklch(0.40 0.010 250);
+  --fg-3:      oklch(0.55 0.012 250);
+  --fg-4:      oklch(0.66 0.012 250);
+  --line:      oklch(0.84 0.007 130);
+  --line-2:    oklch(0.90 0.005 130);
+  --accent:    oklch(0.45 0.18 145);
+  --accent-2:  oklch(0.42 0.20 145);
+  --accent-fg: oklch(0.98 0.003 130);
+  --warn:      oklch(0.55 0.16 75);
+  --good:      oklch(0.45 0.18 145);
+  --bad:       oklch(0.55 0.20 25);
+  --shadow:    0 0 0 1px rgba(0,0,0,0.04) inset;
+}
+
+/* =========================
+   Shared utility classes
+   ========================= */
+.app {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.mono { font-family: var(--font-mono); font-feature-settings: 'tnum' 1, 'cv11' 1; }
+.display { font-family: var(--font-display); }
+.tnum { font-variant-numeric: tabular-nums; }
+
+.hairline { background: var(--line); }
+.hairline-x { height: 1px; background: var(--line); width: 100%; }
+.hairline-y { width: 1px; background: var(--line); align-self: stretch; }
+
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-2);
+  color: var(--fg-2);
+  display: inline-block;
+  line-height: 1.4;
+  font-feature-settings: 'tnum' 1;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  color: var(--fg-2);
+  text-transform: lowercase;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.tag.accent { background: color-mix(in oklab, var(--accent) 22%, transparent); color: var(--accent); }
+.tag.warn { background: color-mix(in oklab, var(--warn) 22%, transparent); color: var(--warn); }
+
+.scroll { overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll::-webkit-scrollbar-track { background: transparent; }
+.scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+.scroll::-webkit-scrollbar-thumb:hover { background: var(--fg-4); }
+
+button { font: inherit; color: inherit; background: transparent; border: 0; cursor: pointer; }
+
+input, textarea {
+  font: inherit; color: inherit; background: transparent; border: 0; outline: 0;
+}
+
+/* command palette (shared modal) */
+.palette-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: color-mix(in oklab, var(--bg) 70%, transparent);
+  backdrop-filter: blur(8px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 12vh;
+}
+.palette {
+  width: min(720px, 92vw);
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  font-size: 13px;
+}
+.palette-input {
+  width: 100%;
+  padding: 16px 20px;
+  font-size: 16px;
+  font-family: var(--font-sans);
+  border-bottom: 1px solid var(--line);
+}
+.palette.theme-console-styled .palette-input { font-family: var(--font-mono); }
+.palette-input::placeholder { color: var(--fg-4); }
+.palette-list { max-height: 50vh; overflow-y: auto; padding: 6px 0; }
+.palette-section-label {
+  padding: 10px 20px 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-4);
+}
+.palette-item {
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 20px;
+  cursor: pointer;
+}
+.palette-item:hover, .palette-item.active {
+  background: var(--bg-2);
+}
+.palette-item .icon { width: 16px; color: var(--fg-3); flex-shrink: 0; }
+.palette-item .label { flex: 1; }
+.palette-item .hint { color: var(--fg-4); font-family: var(--font-mono); font-size: 11px; }
+.palette-foot {
+  display: flex; justify-content: space-between;
+  padding: 10px 20px;
+  border-top: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-4);
+  background: var(--bg-2);
+}
+.palette-foot .group { display: flex; gap: 14px; align-items: center; }
+
+/* selection */
+::selection { background: color-mix(in oklab, var(--accent) 35%, transparent); color: var(--fg); }
+
+/* focus ring */
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+
+/* prose for email body */
+.prose { font-family: var(--font-sans); font-size: 13.5px; line-height: 1.65; color: var(--fg); }
+.prose p { margin: 0 0 0.85em; }
+.prose code { font-family: var(--font-mono); font-size: 12px; padding: 1px 5px; background: var(--bg-2); border-radius: 3px; border: 1px solid var(--line-2); }
+.prose strong { color: var(--fg); font-weight: 600; }
+.prose em { color: var(--fg-2); }
+.prose ol, .prose ul { margin: 0 0 0.85em; padding-left: 1.4em; }
+.prose li { margin-bottom: 0.3em; }
+.prose blockquote { border-left: 2px solid var(--line); padding-left: 12px; color: var(--fg-2); margin: 0 0 0.85em; }
+.theme-spool .prose { font-family: 'Newsreader', Georgia, serif; font-size: 15px; line-height: 1.7; }
+.theme-console .prose { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; }
