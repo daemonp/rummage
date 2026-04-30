@@ -41,14 +41,20 @@ async fn run(config: Config) -> anyhow::Result<()> {
         info!("Running full re-index (--index)");
         let maildir = config.maildir.clone();
         let db_path = db_path.map(std::borrow::ToOwned::to_owned);
+        let start = std::time::Instant::now();
         tokio::task::spawn_blocking(move || db::force_reindex(&maildir, db_path.as_deref()))
             .await??;
-        info!("Indexing complete. Exiting.");
+        info!(
+            "Indexing complete in {:.1}s. Exiting.",
+            start.elapsed().as_secs_f64()
+        );
         return Ok(());
     }
 
+    info!("Spawning database worker...");
     let db_handle =
         db::spawn_database_worker(&config.maildir, db_path, config.no_auto_index).await?;
+    info!("Database worker ready");
 
     let mcp_enabled = !config.no_mcp
         && std::env::var("RUMMAGE_MCP_ENABLED")

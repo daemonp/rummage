@@ -31,6 +31,9 @@ pub enum AppError {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl IntoResponse for AppError {
@@ -38,6 +41,7 @@ impl IntoResponse for AppError {
         let (status, client_message) = match &self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             // Internal errors: log details server-side, return generic message to client.
             Self::Notmuch(_)
             | Self::MailParse(_)

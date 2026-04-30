@@ -9,8 +9,8 @@ use crate::api::stats::ArchiveStats;
 use crate::api::thread::{ConversationTree, ThreadDetail};
 use crate::error::{AppError, Result};
 use std::path::Path;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tokio::sync::{mpsc, oneshot, watch};
+use tracing::{error, info, warn};
 
 /// Attachment data returned from the DB worker.
 pub struct AttachmentData {
@@ -75,10 +75,19 @@ pub enum DbRequest {
     },
 }
 
+/// Lifecycle state of the DB worker, exposed via a `watch` channel.
+#[derive(Clone, Debug)]
+pub enum DbState {
+    Initializing,
+    Ready,
+    Failed(String),
+}
+
 /// Handle to the DB worker. Clone freely — it is just an `mpsc::Sender` wrapper.
 #[derive(Clone)]
 pub struct DbHandle {
     sender: mpsc::Sender<DbRequest>,
+    state: watch::Receiver<DbState>,
 }
 
 impl DbHandle {
@@ -90,6 +99,17 @@ impl DbHandle {
         &self,
         make_req: impl FnOnce(oneshot::Sender<Result<T>>) -> DbRequest,
     ) -> Result<T> {
+        match self.state.borrow().clone() {
+            DbState::Ready => {}
+            DbState::Failed(ref e) => {
+                return Err(AppError::ServiceUnavailable(e.clone()));
+            }
+            DbState::Initializing => {
+                return Err(AppError::ServiceUnavailable(
+                    "Database is still initializing".into(),
+                ));
+            }
+        }
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(make_req(tx))
@@ -198,6 +218,24 @@ impl DbHandle {
         .await
     }
 
+    /// Wait until the database worker has finished initialization.
+    ///
+    /// Returns `Ok(())` when the DB is ready, or `Err` if initialization
+    /// failed (e.g. missing notmuch config, corrupt database, etc.).
+    pub async fn wait_for_ready(&self) -> Result<()> {
+        let mut rx = self.state.clone();
+        loop {
+            match rx.borrow().clone() {
+                DbState::Ready => return Ok(()),
+                DbState::Failed(ref e) => return Err(AppError::ServiceUnavailable(e.clone())),
+                DbState::Initializing => {}
+            }
+            if rx.changed().await.is_err() {
+                return Err(AppError::Internal("DB worker dropped state channel".into()));
+            }
+        }
+    }
+
     /// Extract attachment text (stub).
     pub async fn attachment_text(
         &self,
@@ -255,6 +293,7 @@ pub async fn spawn_database_worker(
 
     let (startup_tx, startup_rx) = oneshot::channel::<Result<()>>();
     let (sender, mut receiver) = mpsc::channel::<DbRequest>(32);
+    let (state_tx, state_rx) = watch::channel(DbState::Initializing);
 
     tokio::task::spawn_blocking(move || {
         let db_result = (|| -> Result<notmuch::Database> {
@@ -267,8 +306,13 @@ pub async fn spawn_database_worker(
                         db_path.display()
                     )));
                 }
-                info!("No notmuch database found; creating and indexing...");
+                info!(
+                    "No notmuch database found at {}; creating and indexing...",
+                    db_path.display()
+                );
                 create_and_index(&maildir, config_path.as_deref())?;
+            } else {
+                info!("Opening notmuch database at {}...", db_path.display());
             }
 
             let db = notmuch::Database::open_with_config(
@@ -278,132 +322,153 @@ pub async fn spawn_database_worker(
                 None,
             )?;
 
+            info!("Database ready");
             Ok(db)
         })();
 
-        let db = match db_result {
-            Ok(db) => db,
+        match db_result {
+            Ok(db) => {
+                let _ = state_tx.send(DbState::Ready);
+                if startup_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Some(req) = receiver.blocking_recv() {
+                    let _span = match &req {
+                        DbRequest::Search { .. } => {
+                            tracing::info_span!("db_request", kind = "search")
+                        }
+                        DbRequest::Thread { .. } => {
+                            tracing::info_span!("db_request", kind = "thread")
+                        }
+                        DbRequest::Attachment { .. } => {
+                            tracing::info_span!("db_request", kind = "attachment")
+                        }
+                        DbRequest::RawMessage { .. } => {
+                            tracing::info_span!("db_request", kind = "raw_message")
+                        }
+                        DbRequest::Tags { .. } => tracing::info_span!("db_request", kind = "tags"),
+                        DbRequest::Stats { .. } => {
+                            tracing::info_span!("db_request", kind = "stats")
+                        }
+                        DbRequest::Senders { .. } => {
+                            tracing::info_span!("db_request", kind = "senders")
+                        }
+                        DbRequest::Count { .. } => {
+                            tracing::info_span!("db_request", kind = "count")
+                        }
+                        DbRequest::MessageDetail { .. } => {
+                            tracing::info_span!("db_request", kind = "message_detail")
+                        }
+                        DbRequest::SendersWithQuery { .. } => {
+                            tracing::info_span!("db_request", kind = "senders_with_query")
+                        }
+                        DbRequest::ThreadTree { .. } => {
+                            tracing::info_span!("db_request", kind = "thread_tree")
+                        }
+                        DbRequest::AttachmentText { .. } => {
+                            tracing::info_span!("db_request", kind = "attachment_text")
+                        }
+                    }
+                    .entered();
+
+                    match req {
+                        DbRequest::Search {
+                            query,
+                            offset,
+                            limit,
+                            sort,
+                            respond,
+                        } => {
+                            let _ = respond.send(crate::api::search::do_search(
+                                &db,
+                                &query,
+                                offset,
+                                limit,
+                                sort.as_deref(),
+                            ));
+                        }
+                        DbRequest::Thread { thread_id, respond } => {
+                            let _ = respond.send(crate::api::thread::do_thread(&db, &thread_id));
+                        }
+                        DbRequest::Attachment {
+                            msg_id,
+                            part_num,
+                            respond,
+                        } => {
+                            let _ = respond.send(crate::api::attachment::do_attachment(
+                                &db, &msg_id, part_num,
+                            ));
+                        }
+                        DbRequest::RawMessage { msg_id, respond } => {
+                            let _ = respond.send(crate::api::message::do_raw_message(&db, &msg_id));
+                        }
+                        DbRequest::Tags { respond } => {
+                            let _ = respond.send(crate::api::tags::do_tags(&db));
+                        }
+                        DbRequest::Stats { respond } => {
+                            let _ = respond.send(crate::api::stats::do_stats(&db));
+                        }
+                        DbRequest::Senders { respond } => {
+                            let _ = respond.send(crate::api::senders::do_senders(&db));
+                        }
+                        DbRequest::Count { query, respond } => {
+                            let _ = respond.send(crate::api::stats::do_count(&db, &query));
+                        }
+                        DbRequest::MessageDetail { msg_id, respond } => {
+                            let _ =
+                                respond.send(crate::api::message::do_message_detail(&db, &msg_id));
+                        }
+                        DbRequest::SendersWithQuery {
+                            query,
+                            limit,
+                            respond,
+                        } => {
+                            let _ = respond.send(crate::api::senders::do_senders_with_query(
+                                &db,
+                                query.as_deref(),
+                                limit,
+                            ));
+                        }
+                        DbRequest::ThreadTree { thread_id, respond } => {
+                            let _ =
+                                respond.send(crate::api::thread::do_thread_tree(&db, &thread_id));
+                        }
+                        DbRequest::AttachmentText {
+                            msg_id,
+                            part,
+                            format,
+                            respond,
+                        } => {
+                            let _ = respond.send(crate::api::attachment::do_attachment_text(
+                                &db, &msg_id, part, &format,
+                            ));
+                        }
+                    }
+                }
+            }
             Err(e) => {
+                let _ = state_tx.send(DbState::Failed(e.to_string()));
                 let _ = startup_tx.send(Err(e));
-                return;
-            }
-        };
-
-        // Signal that the worker has finished startup successfully.
-        if startup_tx.send(Ok(())).is_err() {
-            return;
-        }
-
-        while let Some(req) = receiver.blocking_recv() {
-            let _span = match &req {
-                DbRequest::Search { .. } => tracing::info_span!("db_request", kind = "search"),
-                DbRequest::Thread { .. } => tracing::info_span!("db_request", kind = "thread"),
-                DbRequest::Attachment { .. } => {
-                    tracing::info_span!("db_request", kind = "attachment")
-                }
-                DbRequest::RawMessage { .. } => {
-                    tracing::info_span!("db_request", kind = "raw_message")
-                }
-                DbRequest::Tags { .. } => tracing::info_span!("db_request", kind = "tags"),
-                DbRequest::Stats { .. } => tracing::info_span!("db_request", kind = "stats"),
-                DbRequest::Senders { .. } => tracing::info_span!("db_request", kind = "senders"),
-                DbRequest::Count { .. } => tracing::info_span!("db_request", kind = "count"),
-                DbRequest::MessageDetail { .. } => {
-                    tracing::info_span!("db_request", kind = "message_detail")
-                }
-                DbRequest::SendersWithQuery { .. } => {
-                    tracing::info_span!("db_request", kind = "senders_with_query")
-                }
-                DbRequest::ThreadTree { .. } => {
-                    tracing::info_span!("db_request", kind = "thread_tree")
-                }
-                DbRequest::AttachmentText { .. } => {
-                    tracing::info_span!("db_request", kind = "attachment_text")
-                }
-            }
-            .entered();
-
-            match req {
-                DbRequest::Search {
-                    query,
-                    offset,
-                    limit,
-                    sort,
-                    respond,
-                } => {
-                    let _ = respond.send(crate::api::search::do_search(
-                        &db,
-                        &query,
-                        offset,
-                        limit,
-                        sort.as_deref(),
-                    ));
-                }
-                DbRequest::Thread { thread_id, respond } => {
-                    let _ = respond.send(crate::api::thread::do_thread(&db, &thread_id));
-                }
-                DbRequest::Attachment {
-                    msg_id,
-                    part_num,
-                    respond,
-                } => {
-                    let _ = respond.send(crate::api::attachment::do_attachment(
-                        &db, &msg_id, part_num,
-                    ));
-                }
-                DbRequest::RawMessage { msg_id, respond } => {
-                    let _ = respond.send(crate::api::message::do_raw_message(&db, &msg_id));
-                }
-                DbRequest::Tags { respond } => {
-                    let _ = respond.send(crate::api::tags::do_tags(&db));
-                }
-                DbRequest::Stats { respond } => {
-                    let _ = respond.send(crate::api::stats::do_stats(&db));
-                }
-                DbRequest::Senders { respond } => {
-                    let _ = respond.send(crate::api::senders::do_senders(&db));
-                }
-                DbRequest::Count { query, respond } => {
-                    let _ = respond.send(crate::api::stats::do_count(&db, &query));
-                }
-                DbRequest::MessageDetail { msg_id, respond } => {
-                    let _ = respond.send(crate::api::message::do_message_detail(&db, &msg_id));
-                }
-                DbRequest::SendersWithQuery {
-                    query,
-                    limit,
-                    respond,
-                } => {
-                    let _ = respond.send(crate::api::senders::do_senders_with_query(
-                        &db,
-                        query.as_deref(),
-                        limit,
-                    ));
-                }
-                DbRequest::ThreadTree { thread_id, respond } => {
-                    let _ = respond.send(crate::api::thread::do_thread_tree(&db, &thread_id));
-                }
-                DbRequest::AttachmentText {
-                    msg_id,
-                    part,
-                    format,
-                    respond,
-                } => {
-                    let _ = respond.send(crate::api::attachment::do_attachment_text(
-                        &db, &msg_id, part, &format,
-                    ));
-                }
             }
         }
     });
 
-    match startup_rx.await {
-        Ok(Ok(())) => Ok(DbHandle { sender }),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(AppError::Internal(
-            "DB worker dropped startup signal".into(),
-        )),
-    }
+    // Don't block server startup on DB initialization.  Await the startup
+    // confirmation in a background task so the HTTP server can bind immediately
+    // and serve the /api/health endpoint (and return 503 for DB endpoints
+    // while indexing is still underway).
+    tokio::spawn(async move {
+        match startup_rx.await {
+            Ok(Ok(())) => info!("Database worker initialized successfully"),
+            Ok(Err(e)) => error!("Database worker initialization failed: {}", e),
+            Err(_) => error!("Database worker dropped startup signal"),
+        }
+    });
+
+    Ok(DbHandle {
+        sender,
+        state: state_rx,
+    })
 }
 
 /// Force a full re-index of the maildir, then exit.
@@ -428,6 +493,8 @@ pub fn force_reindex(maildir: &Path, config_path: Option<&Path>) -> Result<()> {
 }
 
 fn create_and_index(maildir: &Path, config_path: Option<&Path>) -> Result<()> {
+    info!("Creating notmuch database at {}...", maildir.display());
+
     // Database::create does not accept a config path, so we create with the
     // default config and then reopen with the user-supplied one if provided.
     let db = notmuch::Database::create(maildir).map_err(AppError::Notmuch)?;
@@ -447,8 +514,12 @@ fn create_and_index(maildir: &Path, config_path: Option<&Path>) -> Result<()> {
 
 fn index_maildir(db: &notmuch::Database, maildir: &Path) {
     info!("Walking maildir for indexing...");
+    let start = std::time::Instant::now();
 
     let mut indexed = 0usize;
+    let mut last_reported = 0usize;
+    const REPORT_INTERVAL: usize = 1_000;
+
     for entry in walkdir::WalkDir::new(maildir)
         .into_iter()
         .filter_map(std::result::Result::ok)
@@ -461,10 +532,29 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
                     warn!("Failed to index {path:?}: {e}");
                 } else {
                     indexed += 1;
+                    if indexed - last_reported >= REPORT_INTERVAL {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let rate = if elapsed > 0.0 {
+                            indexed as f64 / elapsed
+                        } else {
+                            0.0
+                        };
+                        info!("Indexed {} messages ({:.0} msg/s)...", indexed, rate);
+                        last_reported = indexed;
+                    }
                 }
             }
         }
     }
 
-    info!("Indexed {indexed} messages");
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = if elapsed > 0.0 {
+        indexed as f64 / elapsed
+    } else {
+        0.0
+    };
+    info!(
+        "Indexed {} messages in {:.1}s ({:.0} msg/s)",
+        indexed, elapsed, rate
+    );
 }

@@ -35,6 +35,9 @@ async fn setup_handler() -> Option<RummageMcpHandler> {
     let db = db::spawn_database_worker(&maildir, None, false)
         .await
         .ok()?;
+    if db.wait_for_ready().await.is_err() {
+        return None;
+    }
     Some(RummageMcpHandler::new(db).await)
 }
 

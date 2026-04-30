@@ -6,7 +6,7 @@ use crate::ui::home::HomePage;
 use crate::ui::search::SearchPage;
 use crate::ui::thread::ThreadPage;
 use crate::ui::{render_page, AppShell, Header, SidebarRow, Subheader};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::header::COOKIE;
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
@@ -44,6 +44,12 @@ fn theme_from_cookies(headers: &axum::http::HeaderMap) -> &'static str {
     "dark"
 }
 
+/// Simple liveness / health endpoint that returns 200 as soon as the server
+/// is listening.  Does not touch the database, so it works during indexing.
+async fn health_handler() -> impl IntoResponse {
+    axum::Json(serde_json::json!({"status": "ok"}))
+}
+
 /// Start the Axum HTTP server on the given host and port.
 ///
 /// # Errors
@@ -62,6 +68,48 @@ pub async fn serve(
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// W3C common-log-format request logging.
+///
+/// Logs: remote-host ident authuser [date] "method path protocol" status bytes latency
+async fn request_logger(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let start = std::time::Instant::now();
+
+    let remote_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let method = request.method().to_string();
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), |p| p.to_string());
+    let version = format!("{:?}", request.version());
+
+    let response = next.run(request).await;
+
+    let status = response.status().as_u16();
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let content_length = response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+
+    let timestamp = chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z");
+
+    info!(
+        "{} - - [{}] \"{} {} {}\" {} {} {:.1}ms",
+        remote_addr, timestamp, method, path, version, status, content_length, latency_ms
+    );
+
+    response
 }
 
 async fn security_headers(
@@ -85,6 +133,7 @@ async fn security_headers(
 async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
     let mut router = Router::new()
         // JSON API routes — always present
+        .route("/api/health", get(health_handler))
         .route("/api/search", get(api::search::handler))
         .route("/api/thread/:id", get(api::thread::handler))
         .route("/api/attachment", get(api::attachment::handler))
@@ -126,6 +175,7 @@ async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
         .with_state(db)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(request_logger))
 }
 
 // ── Static asset handlers ─────────────────────────────────────────

@@ -7,9 +7,9 @@ use crate::api::thread::MessageDetail;
 use crate::db::DbHandle;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ReadResourceResult, ServerCapabilities,
-    ServerInfo,
+    GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ReadResourceResult,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::RoleServer;
@@ -218,6 +218,7 @@ impl ServerHandler for RummageMcpHandler {
                 .enable_prompts()
                 .build(),
         )
+        .with_server_info(Implementation::new("rummage", env!("CARGO_PKG_VERSION")))
         .with_instructions(self.instructions.clone())
     }
 
