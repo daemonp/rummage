@@ -190,7 +190,7 @@ pub enum DateFormat {
 
 /// Format a Unix timestamp according to the given [`DateFormat`].
 pub fn fmt_date(timestamp: i64, mode: DateFormat) -> String {
-    use chrono::{DateTime, Local};
+    use chrono::{DateTime, Datelike, Local};
 
     let dt = match DateTime::from_timestamp(timestamp, 0) {
         Some(d) => d.with_timezone(&Local),
@@ -213,7 +213,11 @@ pub fn fmt_date(timestamp: i64, mode: DateFormat) -> String {
             if secs < 86400 * 7 {
                 return format!("{}d", secs / 86400);
             }
-            dt.format("%b %d").to_string()
+            if dt.year() == now.year() {
+                dt.format("%b %d").to_string()
+            } else {
+                dt.format("%b %d '%y").to_string()
+            }
         }
         DateFormat::Iso => dt.format("%Y-%m-%d %H:%M").to_string(),
         DateFormat::Short => dt.format("%b %d '%y").to_string(),

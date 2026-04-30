@@ -490,7 +490,12 @@ pub fn find_message_bytes(db: &notmuch::Database, msg_id: &str) -> Result<Vec<u8
         .next()
         .ok_or_else(|| AppError::NotFound(format!("message not found: {msg_id}")))?;
     let filename = msg.filename();
-    std::fs::read(filename).map_err(AppError::Io)
+    std::fs::read(&filename).map_err(|e| {
+        AppError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read {}: {e}", filename.display()),
+        ))
+    })
 }
 
 // ── Worker lifecycle ───────────────────────────────────────────────

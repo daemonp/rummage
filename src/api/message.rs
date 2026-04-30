@@ -85,7 +85,12 @@ pub fn do_message_detail(
     let thread_id = msg.thread_id().to_string();
 
     let filename = msg.filename();
-    let bytes = std::fs::read(filename).map_err(AppError::Io)?;
+    let bytes = std::fs::read(&filename).map_err(|e| {
+        AppError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read {}: {e}", filename.display()),
+        ))
+    })?;
 
     let detail = crate::mail::parser::parse_message(&bytes, msg_id, date, date_relative, tags)?;
     Ok(crate::api::thread::ThreadDetail {
