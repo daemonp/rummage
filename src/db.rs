@@ -566,7 +566,13 @@ pub async fn spawn_database_worker(
             move || {
                 let db_path = maildir.join(".notmuch");
 
-                if !db_path.exists() {
+                let db_exists = db_path.exists()
+                    && std::fs::read_dir(&db_path)
+                        .ok()
+                        .and_then(|mut rd| rd.next())
+                        .is_some();
+
+                if !db_exists {
                     if no_auto_index {
                         return Err(AppError::NotFound(format!(
                             "No notmuch database found at {} and --no-auto-index is set",
