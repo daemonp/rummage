@@ -734,17 +734,31 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
 
     info!("Found {} candidate files to index", files.len());
 
-    // ── Phase 2: index with local staging for NFS ─────────────────────
-    // When maildir lives on NFS, each open/read/close is an RPC round-trip.
-    // We pull files to a local staging area in parallel (using idle cores
-    // to overlap NFS latency), then index sequentially from local disk.
-    let staging = std::env::temp_dir().join(format!("rummage-index-{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&staging) {
-        warn!("Failed to create staging dir {staging:?}: {e}; indexing from NFS directly");
-        index_from_paths(db, &files, &mut indexed, &mut last_reported, &mut errors, &start);
-    } else {
-        index_with_staging(db, &files, &staging, &mut indexed, &mut last_reported, &mut errors, &start);
-        let _ = std::fs::remove_dir_all(&staging);
+    // ── Phase 2: index in batches ─────────────────────────────────────
+    // Wrap each batch in begin_atomic/end_atomic so Xapian flushes on our
+    // schedule, not its own.  This turns the spiky sawtooth (auto-commit
+    // every 10k docs) into a sustained disk workload.
+    const BATCH_SIZE: usize = 10_000;
+    let mut batch_start = 0usize;
+    while batch_start < files.len() {
+        let batch_end = (batch_start + BATCH_SIZE).min(files.len());
+        let _ = db.begin_atomic();
+        for path in &files[batch_start..batch_end] {
+            if let Err(e) = db.index_file(path, None) {
+                warn!("Failed to index {path:?}: {e}");
+                errors += 1;
+            } else {
+                indexed += 1;
+                if indexed - last_reported >= 1_000 {
+                    let rate = indexing_rate(indexed, &start);
+                    info!("Indexed {} messages ({:.0} msg/s)...", indexed, rate);
+                    metrics::gauge!("indexing_rate").set(rate);
+                    last_reported = indexed;
+                }
+            }
+        }
+        let _ = db.end_atomic();
+        batch_start = batch_end;
     }
 
     if let Err(e) = db.close() {
@@ -763,103 +777,6 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
         start.elapsed().as_secs_f64(),
         final_rate
     );
-}
-
-/// Index a batch of files directly from their original paths (fallback when
-/// local staging is unavailable).
-fn index_from_paths(
-    db: &notmuch::Database,
-    files: &[std::path::PathBuf],
-    indexed: &mut usize,
-    last_reported: &mut usize,
-    errors: &mut usize,
-    start: &std::time::Instant,
-) {
-    const REPORT_INTERVAL: usize = 1_000;
-    let _ = db.begin_atomic();
-    for path in files {
-        if let Err(e) = db.index_file(path, None) {
-            warn!("Failed to index {path:?}: {e}");
-            *errors += 1;
-        } else {
-            *indexed += 1;
-            if *indexed - *last_reported >= REPORT_INTERVAL {
-                let rate = indexing_rate(*indexed, start);
-                info!("Indexed {} messages ({:.0} msg/s)...", *indexed, rate);
-                metrics::gauge!("indexing_rate").set(rate);
-                *last_reported = *indexed;
-            }
-        }
-    }
-    let _ = db.end_atomic();
-}
-
-/// Copy files to a local staging directory in parallel, then index
-/// sequentially from local disk. This hides NFS latency by overlapping
-/// reads across multiple threads while the single-threaded Xapian indexer
-/// works on already-local files.
-fn index_with_staging(
-    db: &notmuch::Database,
-    files: &[std::path::PathBuf],
-    staging: &std::path::Path,
-    indexed: &mut usize,
-    last_reported: &mut usize,
-    errors: &mut usize,
-    start: &std::time::Instant,
-) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const CHUNK_SIZE: usize = 5_000;
-    const COPY_WORKERS: usize = 8;
-    const REPORT_INTERVAL: usize = 1_000;
-
-    for chunk in files.chunks(CHUNK_SIZE) {
-        // Parallel copy: N workers pull from the chunk using an atomic index
-        // and copy files into the staging directory.
-        let idx = AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..COPY_WORKERS {
-                s.spawn(|| {
-                    loop {
-                        let i = idx.fetch_add(1, Ordering::Relaxed);
-                        if i >= chunk.len() {
-                            break;
-                        }
-                        let src = &chunk[i];
-                        let dst = staging.join(format!("{:08}", i));
-                        if let Err(e) = std::fs::copy(src, &dst) {
-                            warn!("Staging copy failed for {src:?}: {e}");
-                        }
-                    }
-                });
-            }
-        });
-
-        // Sequential index from local staging, then clean up.
-        let _ = db.begin_atomic();
-        for i in 0..chunk.len() {
-            let staged = staging.join(format!("{:08}", i));
-            if !staged.exists() {
-                // Copy failed; skip.
-                *errors += 1;
-                continue;
-            }
-            if let Err(e) = db.index_file(&staged, None) {
-                warn!("Failed to index staged file {staged:?}: {e}");
-                *errors += 1;
-            } else {
-                *indexed += 1;
-                if *indexed - *last_reported >= REPORT_INTERVAL {
-                    let rate = indexing_rate(*indexed, start);
-                    info!("Indexed {} messages ({:.0} msg/s)...", *indexed, rate);
-                    metrics::gauge!("indexing_rate").set(rate);
-                    *last_reported = *indexed;
-                }
-            }
-            let _ = std::fs::remove_file(&staged);
-        }
-        let _ = db.end_atomic();
-    }
 }
 
 // ── Performance tests ───────────────────────────────────────────────
@@ -1174,5 +1091,17 @@ mod perf_tests {
         force_reindex(&maildir, config.as_deref()).expect("reindex");
         let elapsed = start.elapsed();
         println!("Full reindex of test archive -> {elapsed:?}");
+
+        // Verify all messages were indexed
+        let db = notmuch::Database::open_with_config(
+            Some(&maildir),
+            notmuch::DatabaseMode::ReadOnly,
+            config.as_deref(),
+            None,
+        )
+        .expect("open for count");
+        let query = db.create_query("*").expect("create query");
+        let count = query.count_messages().expect("count messages");
+        println!("Messages in database after reindex: {count}");
     }
 }
