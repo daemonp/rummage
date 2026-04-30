@@ -10,8 +10,13 @@ use crate::api::stats::ArchiveStats;
 use crate::api::thread::{ConversationTree, ThreadDetail};
 use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
-use tokio::sync::{oneshot, watch};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, watch, RwLock};
 use tracing::{error, info, warn};
+
+/// TTL for cached sidebar data (tags, senders, stats).
+const SIDEBAR_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Attachment data returned from the DB worker.
 pub struct AttachmentData {
@@ -84,12 +89,21 @@ pub enum DbState {
     Failed(String),
 }
 
+/// Cached sidebar data with timestamps.
+#[derive(Default)]
+struct Cache {
+    tags: Option<(Vec<(String, usize)>, Instant)>,
+    senders: Option<(Vec<(String, usize)>, Instant)>,
+    stats: Option<(ArchiveStats, Instant)>,
+}
+
 /// Handle to the DB layer. Clone freely.
 #[derive(Clone)]
 pub struct DbHandle {
     maildir: PathBuf,
     config_path: Option<PathBuf>,
     state: watch::Receiver<DbState>,
+    cache: Arc<RwLock<Cache>>,
 }
 
 impl DbHandle {
@@ -180,19 +194,60 @@ impl DbHandle {
         .await
     }
 
-    /// List all tags with their message counts.
+    /// List all tags with their message counts (cached).
     pub async fn tags(&self) -> Result<Vec<(String, usize)>> {
-        self.request(|tx| DbRequest::Tags { respond: tx }).await
+        {
+            let cache = self.cache.read().await;
+            if let Some((ref data, ts)) = cache.tags {
+                if ts.elapsed() < SIDEBAR_CACHE_TTL {
+                    return Ok(data.clone());
+                }
+            }
+        }
+        let result = self.request(|tx| DbRequest::Tags { respond: tx }).await?;
+        {
+            let mut cache = self.cache.write().await;
+            cache.tags = Some((result.clone(), Instant::now()));
+        }
+        Ok(result)
     }
 
-    /// Get archive-wide statistics.
+    /// Get archive-wide statistics (cached).
     pub async fn stats(&self) -> Result<ArchiveStats> {
-        self.request(|tx| DbRequest::Stats { respond: tx }).await
+        {
+            let cache = self.cache.read().await;
+            if let Some((ref data, ts)) = cache.stats {
+                if ts.elapsed() < SIDEBAR_CACHE_TTL {
+                    return Ok(data.clone());
+                }
+            }
+        }
+        let result = self.request(|tx| DbRequest::Stats { respond: tx }).await?;
+        {
+            let mut cache = self.cache.write().await;
+            cache.stats = Some((result.clone(), Instant::now()));
+        }
+        Ok(result)
     }
 
-    /// Get top senders with message counts.
+    /// Get top senders with message counts (cached).
     pub async fn senders(&self) -> Result<Vec<(String, usize)>> {
-        self.request(|tx| DbRequest::Senders { respond: tx }).await
+        {
+            let cache = self.cache.read().await;
+            if let Some((ref data, ts)) = cache.senders {
+                if ts.elapsed() < SIDEBAR_CACHE_TTL {
+                    return Ok(data.clone());
+                }
+            }
+        }
+        let result = self
+            .request(|tx| DbRequest::Senders { respond: tx })
+            .await?;
+        {
+            let mut cache = self.cache.write().await;
+            cache.senders = Some((result.clone(), Instant::now()));
+        }
+        Ok(result)
     }
 
     /// Count threads and messages matching a query.
@@ -513,6 +568,7 @@ pub async fn spawn_database_worker(
         maildir,
         config_path,
         state: state_rx,
+        cache: Arc::new(RwLock::new(Cache::default())),
     })
 }
 
@@ -530,6 +586,7 @@ impl DbHandle {
                 maildir: PathBuf::new(),
                 config_path: None,
                 state: state_rx,
+                cache: Arc::new(RwLock::new(Cache::default())),
             },
             state_tx,
         )
@@ -626,4 +683,302 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
         start.elapsed().as_secs_f64(),
         indexing_rate(indexed, &start)
     );
+}
+
+// ── Performance tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    fn test_maildir() -> Option<(PathBuf, Option<PathBuf>)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let maildir = root.join("mail/test-archive");
+        let config = root.join("notmuch-config");
+        if maildir.exists() {
+            Some((maildir, if config.exists() { Some(config) } else { None }))
+        } else {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn perf_search_inbox() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        let start = Instant::now();
+        let result = db
+            .search("tag:inbox".into(), None, Some(20), None)
+            .await
+            .expect("search");
+        let elapsed = start.elapsed();
+        println!(
+            "search tag:inbox -> {} threads in {:?}",
+            result.threads.len(),
+            elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "search took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_search_broad_query() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        let start = Instant::now();
+        let result = db
+            .search("*".into(), None, Some(20), None)
+            .await
+            .expect("search");
+        let elapsed = start.elapsed();
+        println!(
+            "search * -> {} threads in {:?}",
+            result.threads.len(),
+            elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "broad search took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_tags_uncached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        let start = Instant::now();
+        let tags = db.tags().await.expect("tags");
+        let elapsed = start.elapsed();
+        println!("tags (uncached) -> {} tags in {:?}", tags.len(), elapsed);
+        assert!(
+            elapsed.as_millis() < 2000,
+            "tags took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_tags_cached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        // Warm cache
+        let _ = db.tags().await.expect("tags");
+
+        let start = Instant::now();
+        let tags = db.tags().await.expect("tags cached");
+        let elapsed = start.elapsed();
+        println!("tags (cached) -> {} tags in {:?}", tags.len(), elapsed);
+        assert!(
+            elapsed.as_millis() < 100,
+            "cached tags took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_senders_uncached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        let start = Instant::now();
+        let senders = db.senders().await.expect("senders");
+        let elapsed = start.elapsed();
+        println!(
+            "senders (uncached) -> {} senders in {:?}",
+            senders.len(),
+            elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 2000,
+            "senders took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_senders_cached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        // Warm cache
+        let _ = db.senders().await.expect("senders");
+
+        let start = Instant::now();
+        let senders = db.senders().await.expect("senders cached");
+        let elapsed = start.elapsed();
+        println!(
+            "senders (cached) -> {} senders in {:?}",
+            senders.len(),
+            elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 100,
+            "cached senders took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_stats_uncached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        let start = Instant::now();
+        let stats = db.stats().await.expect("stats");
+        let elapsed = start.elapsed();
+        println!(
+            "stats (uncached) -> {} msgs / {} threads in {:?}",
+            stats.total_messages, stats.total_threads, elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 2000,
+            "stats took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_stats_cached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        // Warm cache
+        let _ = db.stats().await.expect("stats");
+
+        let start = Instant::now();
+        let stats = db.stats().await.expect("stats cached");
+        let elapsed = start.elapsed();
+        println!(
+            "stats (cached) -> {} msgs / {} threads in {:?}",
+            stats.total_messages, stats.total_threads, elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 100,
+            "cached stats took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_sidebar_parallel_then_cached() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        // First request: parallel uncached
+        let start = Instant::now();
+        let (tags, senders, stats) = tokio::join!(db.tags(), db.senders(), db.stats());
+        let _ = tags.expect("tags");
+        let _ = senders.expect("senders");
+        let _ = stats.expect("stats");
+        let elapsed = start.elapsed();
+        println!("sidebar parallel (uncached) in {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 3000,
+            "parallel sidebar took too long: {:?}",
+            elapsed
+        );
+
+        // Second request: all cached
+        let start = Instant::now();
+        let (tags, senders, stats) = tokio::join!(db.tags(), db.senders(), db.stats());
+        let _ = tags.expect("tags");
+        let _ = senders.expect("senders");
+        let _ = stats.expect("stats");
+        let elapsed = start.elapsed();
+        println!("sidebar parallel (cached) in {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 200,
+            "cached parallel sidebar took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_search_plus_sidebar() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db = spawn_database_worker(&maildir, config.as_deref(), false)
+            .await
+            .expect("spawn worker");
+        db.wait_for_ready().await.expect("db ready");
+
+        // Warm sidebar cache
+        let _ = db.tags().await;
+        let _ = db.senders().await;
+        let _ = db.stats().await;
+
+        let start = Instant::now();
+        let (results, _tags, _senders, _stats) = tokio::join!(
+            db.search("from:example.org".into(), None, Some(20), None),
+            db.tags(),
+            db.senders(),
+            db.stats(),
+        );
+        let result = results.expect("search");
+        let elapsed = start.elapsed();
+        println!(
+            "search + sidebar (cached) -> {} threads in {:?}",
+            result.threads.len(),
+            elapsed
+        );
+        assert!(
+            elapsed.as_millis() < 1000,
+            "search + cached sidebar took too long: {:?}",
+            elapsed
+        );
+    }
 }
