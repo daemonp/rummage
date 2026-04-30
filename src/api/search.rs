@@ -82,22 +82,6 @@ pub fn do_search(
             let tags: Vec<String> = thread.tags().collect();
             let has_attachments = tags.iter().any(|t| t.contains("attachment"));
 
-            // Build preview from the first matched message in the thread.
-            let preview = thread.messages().next().and_then(|msg| {
-                crate::mail::extract_message(&msg)
-                    .ok()
-                    .and_then(|detail| {
-                        detail.body_text.or_else(|| {
-                            if detail.content_type == "text/plain" {
-                                Some(detail.content)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .map(|text| crate::mail::body::truncate_text(&text, 200))
-            });
-
             ThreadSummary {
                 thread_id: thread.id().to_string(),
                 subject: thread.subject().to_string(),
@@ -107,7 +91,7 @@ pub fn do_search(
                 newest_date: thread.newest_date(),
                 oldest_date: thread.oldest_date(),
                 tags,
-                preview,
+                preview: None,
                 has_attachments,
             }
         })
