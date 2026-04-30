@@ -1,15 +1,16 @@
-//! Single-threaded notmuch database worker.
+//! Multi-threaded notmuch database access.
 //!
-//! All `libnotmuch` access is serialized through a single `spawn_blocking`
-//! thread.  Callers interact via the [`DbHandle`] which sends requests over
-//! an `mpsc` channel and awaits responses on a `oneshot`.
+//! Each DB request is dispatched to a fresh `tokio::task::spawn_blocking`
+//! task that opens its own read-only `notmuch::Database` handle.
+//! This mirrors the netviel approach and eliminates the single-threaded
+//! bottleneck of the previous serialized worker.
 
 use crate::api::search::ThreadList;
 use crate::api::stats::ArchiveStats;
 use crate::api::thread::{ConversationTree, ThreadDetail};
 use crate::error::{AppError, Result};
-use std::path::Path;
-use tokio::sync::{mpsc, oneshot, watch};
+use std::path::{Path, PathBuf};
+use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
 /// Attachment data returned from the DB worker.
@@ -83,18 +84,16 @@ pub enum DbState {
     Failed(String),
 }
 
-/// Handle to the DB worker. Clone freely — it is just an `mpsc::Sender` wrapper.
+/// Handle to the DB layer. Clone freely.
 #[derive(Clone)]
 pub struct DbHandle {
-    sender: mpsc::Sender<DbRequest>,
+    maildir: PathBuf,
+    config_path: Option<PathBuf>,
     state: watch::Receiver<DbState>,
 }
 
 impl DbHandle {
-    /// Send a request to the DB worker and await the response.
-    ///
-    /// This is the single entry-point for all DB communication, eliminating
-    /// the send/receive boilerplate from each public method.
+    /// Send a request to a fresh blocking task and await the response.
     async fn request<T>(
         &self,
         make_req: impl FnOnce(oneshot::Sender<Result<T>>) -> DbRequest,
@@ -111,12 +110,28 @@ impl DbHandle {
             }
         }
         let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(make_req(tx))
-            .await
-            .map_err(|_| AppError::Internal("DB worker channel closed".into()))?;
+        let req = make_req(tx);
+        let maildir = self.maildir.clone();
+        let config_path = self.config_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let db_result = notmuch::Database::open_with_config(
+                Some(&maildir),
+                notmuch::DatabaseMode::ReadOnly,
+                config_path.as_deref(),
+                None,
+            )
+            .map_err(AppError::Notmuch);
+            match db_result {
+                Ok(ref db) => dispatch(db, req),
+                Err(e) => dispatch_err(req, e),
+            }
+        })
+        .await
+        .map_err(|_| AppError::Internal("DB task panicked".into()))?;
+
         rx.await
-            .map_err(|_| AppError::Internal("DB worker dropped response".into()))?
+            .map_err(|_| AppError::Internal("DB task dropped response".into()))?
     }
 
     /// Search email threads by notmuch query.
@@ -231,7 +246,7 @@ impl DbHandle {
                 DbState::Initializing => {}
             }
             if rx.changed().await.is_err() {
-                return Err(AppError::Internal("DB worker dropped state channel".into()));
+                return Err(AppError::Internal("DB state channel closed".into()));
             }
         }
     }
@@ -255,6 +270,150 @@ impl DbHandle {
             respond: tx,
         })
         .await
+    }
+}
+
+// ── Request dispatch ───────────────────────────────────────────────
+
+/// Dispatch a request to the appropriate handler using an open DB handle.
+fn dispatch(db: &notmuch::Database, req: DbRequest) {
+    let _span = match &req {
+        DbRequest::Search { .. } => tracing::info_span!("db_request", kind = "search"),
+        DbRequest::Thread { .. } => tracing::info_span!("db_request", kind = "thread"),
+        DbRequest::Attachment { .. } => tracing::info_span!("db_request", kind = "attachment"),
+        DbRequest::RawMessage { .. } => tracing::info_span!("db_request", kind = "raw_message"),
+        DbRequest::Tags { .. } => tracing::info_span!("db_request", kind = "tags"),
+        DbRequest::Stats { .. } => tracing::info_span!("db_request", kind = "stats"),
+        DbRequest::Senders { .. } => tracing::info_span!("db_request", kind = "senders"),
+        DbRequest::Count { .. } => tracing::info_span!("db_request", kind = "count"),
+        DbRequest::MessageDetail { .. } => {
+            tracing::info_span!("db_request", kind = "message_detail")
+        }
+        DbRequest::SendersWithQuery { .. } => {
+            tracing::info_span!("db_request", kind = "senders_with_query")
+        }
+        DbRequest::ThreadTree { .. } => {
+            tracing::info_span!("db_request", kind = "thread_tree")
+        }
+        DbRequest::AttachmentText { .. } => {
+            tracing::info_span!("db_request", kind = "attachment_text")
+        }
+    }
+    .entered();
+
+    match req {
+        DbRequest::Search {
+            query,
+            offset,
+            limit,
+            sort,
+            respond,
+        } => {
+            let _ = respond.send(crate::api::search::do_search(
+                db,
+                &query,
+                offset,
+                limit,
+                sort.as_deref(),
+            ));
+        }
+        DbRequest::Thread { thread_id, respond } => {
+            let _ = respond.send(crate::api::thread::do_thread(db, &thread_id));
+        }
+        DbRequest::Attachment {
+            msg_id,
+            part_num,
+            respond,
+        } => {
+            let _ = respond.send(crate::api::attachment::do_attachment(
+                db, &msg_id, part_num,
+            ));
+        }
+        DbRequest::RawMessage { msg_id, respond } => {
+            let _ = respond.send(crate::api::message::do_raw_message(db, &msg_id));
+        }
+        DbRequest::Tags { respond } => {
+            let _ = respond.send(crate::api::tags::do_tags(db));
+        }
+        DbRequest::Stats { respond } => {
+            let _ = respond.send(crate::api::stats::do_stats(db));
+        }
+        DbRequest::Senders { respond } => {
+            let _ = respond.send(crate::api::senders::do_senders(db));
+        }
+        DbRequest::Count { query, respond } => {
+            let _ = respond.send(crate::api::stats::do_count(db, &query));
+        }
+        DbRequest::MessageDetail { msg_id, respond } => {
+            let _ = respond.send(crate::api::message::do_message_detail(db, &msg_id));
+        }
+        DbRequest::SendersWithQuery {
+            query,
+            limit,
+            respond,
+        } => {
+            let _ = respond.send(crate::api::senders::do_senders_with_query(
+                db,
+                query.as_deref(),
+                limit,
+            ));
+        }
+        DbRequest::ThreadTree { thread_id, respond } => {
+            let _ = respond.send(crate::api::thread::do_thread_tree(db, &thread_id));
+        }
+        DbRequest::AttachmentText {
+            msg_id,
+            part,
+            format,
+            respond,
+        } => {
+            let _ = respond.send(crate::api::attachment::do_attachment_text(
+                db, &msg_id, part, &format,
+            ));
+        }
+    }
+}
+
+/// Send a DB-open error back through the oneshot channel embedded in the request.
+fn dispatch_err(req: DbRequest, err: AppError) {
+    let _span = tracing::info_span!("db_request", kind = "error").entered();
+    match req {
+        DbRequest::Search { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::Thread { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::Attachment { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::RawMessage { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::Tags { respond } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::Stats { respond } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::Senders { respond } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::Count { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::MessageDetail { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::SendersWithQuery { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::ThreadTree { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
+        DbRequest::AttachmentText { respond, .. } => {
+            let _ = respond.send(Err(err));
+        }
     }
 }
 
@@ -283,11 +442,10 @@ pub fn find_message_bytes(db: &notmuch::Database, msg_id: &str) -> Result<Vec<u8
 
 // ── Worker lifecycle ───────────────────────────────────────────────
 
-/// Spawn the notmuch DB worker thread and return a handle to it.
+/// Spawn the notmuch DB initialization and return a handle.
 ///
 /// # Errors
-/// Returns an error if the database does not exist and cannot be created,
-/// or if the notmuch worker thread panics or fails to start.
+/// Returns an error if the database does not exist and cannot be created.
 pub async fn spawn_database_worker(
     maildir: &Path,
     config_path: Option<&Path>,
@@ -296,182 +454,66 @@ pub async fn spawn_database_worker(
     let maildir = maildir.to_owned();
     let config_path = config_path.map(std::borrow::ToOwned::to_owned);
 
-    let (startup_tx, startup_rx) = oneshot::channel::<Result<()>>();
-    let (sender, mut receiver) = mpsc::channel::<DbRequest>(32);
     let (state_tx, state_rx) = watch::channel(DbState::Initializing);
 
-    tokio::task::spawn_blocking(move || {
-        let db_result = (|| -> Result<notmuch::Database> {
-            let db_path = maildir.join(".notmuch");
+    let init_maildir = maildir.clone();
+    let init_config_path = config_path.clone();
 
-            if !db_path.exists() {
-                if no_auto_index {
-                    return Err(AppError::NotFound(format!(
-                        "No notmuch database found at {} and --no-auto-index is set",
-                        db_path.display()
-                    )));
-                }
-                info!(
-                    "No notmuch database found at {}; creating and indexing...",
-                    db_path.display()
-                );
-                create_and_index(&maildir, config_path.as_deref())?;
-            } else {
-                info!("Opening notmuch database at {}...", db_path.display());
-            }
-
-            let db = notmuch::Database::open_with_config(
-                Some(&maildir),
-                notmuch::DatabaseMode::ReadOnly,
-                config_path.as_deref(),
-                None,
-            )?;
-
-            info!("Database ready");
-            Ok(db)
-        })();
-
-        match db_result {
-            Ok(db) => {
-                let _ = state_tx.send(DbState::Ready);
-                if startup_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                while let Some(req) = receiver.blocking_recv() {
-                    let _span = match &req {
-                        DbRequest::Search { .. } => {
-                            tracing::info_span!("db_request", kind = "search")
-                        }
-                        DbRequest::Thread { .. } => {
-                            tracing::info_span!("db_request", kind = "thread")
-                        }
-                        DbRequest::Attachment { .. } => {
-                            tracing::info_span!("db_request", kind = "attachment")
-                        }
-                        DbRequest::RawMessage { .. } => {
-                            tracing::info_span!("db_request", kind = "raw_message")
-                        }
-                        DbRequest::Tags { .. } => tracing::info_span!("db_request", kind = "tags"),
-                        DbRequest::Stats { .. } => {
-                            tracing::info_span!("db_request", kind = "stats")
-                        }
-                        DbRequest::Senders { .. } => {
-                            tracing::info_span!("db_request", kind = "senders")
-                        }
-                        DbRequest::Count { .. } => {
-                            tracing::info_span!("db_request", kind = "count")
-                        }
-                        DbRequest::MessageDetail { .. } => {
-                            tracing::info_span!("db_request", kind = "message_detail")
-                        }
-                        DbRequest::SendersWithQuery { .. } => {
-                            tracing::info_span!("db_request", kind = "senders_with_query")
-                        }
-                        DbRequest::ThreadTree { .. } => {
-                            tracing::info_span!("db_request", kind = "thread_tree")
-                        }
-                        DbRequest::AttachmentText { .. } => {
-                            tracing::info_span!("db_request", kind = "attachment_text")
-                        }
-                    }
-                    .entered();
-
-                    match req {
-                        DbRequest::Search {
-                            query,
-                            offset,
-                            limit,
-                            sort,
-                            respond,
-                        } => {
-                            let _ = respond.send(crate::api::search::do_search(
-                                &db,
-                                &query,
-                                offset,
-                                limit,
-                                sort.as_deref(),
-                            ));
-                        }
-                        DbRequest::Thread { thread_id, respond } => {
-                            let _ = respond.send(crate::api::thread::do_thread(&db, &thread_id));
-                        }
-                        DbRequest::Attachment {
-                            msg_id,
-                            part_num,
-                            respond,
-                        } => {
-                            let _ = respond.send(crate::api::attachment::do_attachment(
-                                &db, &msg_id, part_num,
-                            ));
-                        }
-                        DbRequest::RawMessage { msg_id, respond } => {
-                            let _ = respond.send(crate::api::message::do_raw_message(&db, &msg_id));
-                        }
-                        DbRequest::Tags { respond } => {
-                            let _ = respond.send(crate::api::tags::do_tags(&db));
-                        }
-                        DbRequest::Stats { respond } => {
-                            let _ = respond.send(crate::api::stats::do_stats(&db));
-                        }
-                        DbRequest::Senders { respond } => {
-                            let _ = respond.send(crate::api::senders::do_senders(&db));
-                        }
-                        DbRequest::Count { query, respond } => {
-                            let _ = respond.send(crate::api::stats::do_count(&db, &query));
-                        }
-                        DbRequest::MessageDetail { msg_id, respond } => {
-                            let _ =
-                                respond.send(crate::api::message::do_message_detail(&db, &msg_id));
-                        }
-                        DbRequest::SendersWithQuery {
-                            query,
-                            limit,
-                            respond,
-                        } => {
-                            let _ = respond.send(crate::api::senders::do_senders_with_query(
-                                &db,
-                                query.as_deref(),
-                                limit,
-                            ));
-                        }
-                        DbRequest::ThreadTree { thread_id, respond } => {
-                            let _ =
-                                respond.send(crate::api::thread::do_thread_tree(&db, &thread_id));
-                        }
-                        DbRequest::AttachmentText {
-                            msg_id,
-                            part,
-                            format,
-                            respond,
-                        } => {
-                            let _ = respond.send(crate::api::attachment::do_attachment_text(
-                                &db, &msg_id, part, &format,
-                            ));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = state_tx.send(DbState::Failed(e.to_string()));
-                let _ = startup_tx.send(Err(e));
-            }
-        }
-    });
-
-    // Don't block server startup on DB initialization.  Await the startup
-    // confirmation in a background task so the HTTP server can bind immediately
-    // and serve the /api/health endpoint (and return 503 for DB endpoints
-    // while indexing is still underway).
     tokio::spawn(async move {
-        match startup_rx.await {
-            Ok(Ok(())) => info!("Database worker initialized successfully"),
-            Ok(Err(e)) => error!("Database worker initialization failed: {}", e),
-            Err(_) => error!("Database worker dropped startup signal"),
+        let init_result = tokio::task::spawn_blocking({
+            let maildir = init_maildir;
+            let config_path = init_config_path;
+            move || {
+                let db_path = maildir.join(".notmuch");
+
+                if !db_path.exists() {
+                    if no_auto_index {
+                        return Err(AppError::NotFound(format!(
+                            "No notmuch database found at {} and --no-auto-index is set",
+                            db_path.display()
+                        )));
+                    }
+                    info!(
+                        "No notmuch database found at {}; creating and indexing...",
+                        db_path.display()
+                    );
+                    create_and_index(&maildir, config_path.as_deref())?;
+                } else {
+                    info!("Opening notmuch database at {}...", db_path.display());
+                }
+
+                let _db = notmuch::Database::open_with_config(
+                    Some(&maildir),
+                    notmuch::DatabaseMode::ReadOnly,
+                    config_path.as_deref(),
+                    None,
+                )
+                .map_err(AppError::Notmuch)?;
+
+                info!("Database ready");
+                Ok(())
+            }
+        })
+        .await;
+
+        match init_result {
+            Ok(Ok(())) => {
+                let _ = state_tx.send(DbState::Ready);
+            }
+            Ok(Err(e)) => {
+                let _ = state_tx.send(DbState::Failed(e.to_string()));
+                error!("Database initialization failed: {}", e);
+            }
+            Err(_) => {
+                let _ = state_tx.send(DbState::Failed("Initialization panicked".into()));
+                error!("Database initialization panicked");
+            }
         }
     });
 
     Ok(DbHandle {
-        sender,
+        maildir,
+        config_path,
         state: state_rx,
     })
 }
@@ -480,7 +522,6 @@ pub async fn spawn_database_worker(
 impl DbHandle {
     /// Build a mock handle for tests with a specific initial state.
     pub fn mock(initializing: bool) -> (Self, watch::Sender<DbState>) {
-        let (sender, _) = mpsc::channel(32);
         let (state_tx, state_rx) = watch::channel(if initializing {
             DbState::Initializing
         } else {
@@ -488,7 +529,8 @@ impl DbHandle {
         });
         (
             DbHandle {
-                sender,
+                maildir: PathBuf::new(),
+                config_path: None,
                 state: state_rx,
             },
             state_tx,
