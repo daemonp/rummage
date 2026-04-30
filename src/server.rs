@@ -16,8 +16,32 @@ use axum::Router;
 use dioxus::prelude::*;
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
+use std::time::Instant;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+
+static METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+
+/// Store the global Prometheus metrics handle so the `/_metrics` handler
+/// can render the current snapshot without changing Axum state types.
+pub fn set_metrics_handle(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    let _ = METRICS_HANDLE.set(handle);
+}
+
+/// Collapse high-cardinality path segments so Prometheus label cardinality
+/// stays bounded (e.g. `/thread/abc123` → `/thread/:id`).
+fn normalize_path(path: &str) -> String {
+    if path.starts_with("/api/thread/") {
+        "/api/thread/:id".to_string()
+    } else if path.starts_with("/api/message/") {
+        "/api/message/:id".to_string()
+    } else if path.starts_with("/thread/") {
+        "/thread/:id".to_string()
+    } else {
+        path.to_string()
+    }
+}
 
 /// Router configuration controlling which route groups are mounted.
 pub struct RouterConfig {
@@ -49,6 +73,19 @@ fn theme_from_cookies(headers: &axum::http::HeaderMap) -> &'static str {
 /// is listening.  Does not touch the database, so it works during indexing.
 async fn health_handler() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Prometheus-compatible metrics endpoint.
+async fn metrics_handler() -> impl IntoResponse {
+    let body = METRICS_HANDLE.get().map(|h| h.render()).unwrap_or_default();
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 /// Readiness probe endpoint. Returns 200 only when the database is ready
@@ -94,7 +131,7 @@ async fn request_logger(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> axum::response::Response {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     let remote_addr = request
         .extensions()
@@ -102,22 +139,36 @@ async fn request_logger(
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "-".to_string());
 
-    let method = request.method().to_string();
-    let path = request
-        .uri()
-        .path_and_query()
-        .map_or_else(|| "/".to_string(), |p| p.to_string());
+    let method = request.method().as_str().to_owned();
+    let path = normalize_path(request.uri().path());
     let version = format!("{:?}", request.version());
 
     let response = next.run(request).await;
 
     let status = response.status().as_u16();
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let latency = start.elapsed().as_secs_f64();
+    let latency_ms = latency * 1000.0;
     let content_length = response
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
+
+    let status_label = status.to_string();
+    metrics::histogram!(
+        "http_request_duration_seconds",
+        "method" => method.clone(),
+        "path" => path.clone(),
+        "status" => status_label.clone(),
+    )
+    .record(latency);
+    metrics::counter!(
+        "http_requests_total",
+        "method" => method.clone(),
+        "path" => path.clone(),
+        "status" => status_label,
+    )
+    .increment(1);
 
     let timestamp = chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z");
 
@@ -149,6 +200,8 @@ async fn security_headers(
 
 async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
     let mut router = Router::new()
+        // Operational / monitoring routes
+        .route("/_metrics", get(metrics_handler))
         // JSON API routes — always present
         .route("/api/health", get(health_handler))
         .route("/api/ready", get(ready_handler))

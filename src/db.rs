@@ -81,6 +81,26 @@ pub enum DbRequest {
     },
 }
 
+impl DbRequest {
+    /// Return a static label for the request variant, used as a metric dimension.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DbRequest::Search { .. } => "search",
+            DbRequest::Thread { .. } => "thread",
+            DbRequest::Attachment { .. } => "attachment",
+            DbRequest::RawMessage { .. } => "raw_message",
+            DbRequest::Tags { .. } => "tags",
+            DbRequest::Stats { .. } => "stats",
+            DbRequest::Senders { .. } => "senders",
+            DbRequest::Count { .. } => "count",
+            DbRequest::MessageDetail { .. } => "message_detail",
+            DbRequest::SendersWithQuery { .. } => "senders_with_query",
+            DbRequest::ThreadTree { .. } => "thread_tree",
+            DbRequest::AttachmentText { .. } => "attachment_text",
+        }
+    }
+}
+
 /// Lifecycle state of the DB worker, exposed via a `watch` channel.
 #[derive(Clone, Debug)]
 pub enum DbState {
@@ -125,10 +145,12 @@ impl DbHandle {
         }
         let (tx, rx) = oneshot::channel();
         let req = make_req(tx);
+        let kind = req.kind();
         let maildir = self.maildir.clone();
         let config_path = self.config_path.clone();
 
         tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
             let db_result = notmuch::Database::open_with_config(
                 Some(&maildir),
                 notmuch::DatabaseMode::ReadOnly,
@@ -136,10 +158,24 @@ impl DbHandle {
                 None,
             )
             .map_err(AppError::Notmuch);
-            match db_result {
-                Ok(ref db) => dispatch(db, req),
-                Err(e) => dispatch_err(req, e),
-            }
+            let success = match db_result {
+                Ok(ref db) => {
+                    dispatch(db, req);
+                    true
+                }
+                Err(e) => {
+                    dispatch_err(req, e);
+                    false
+                }
+            };
+            let duration = start.elapsed().as_secs_f64();
+            metrics::histogram!("db_request_duration_seconds", "kind" => kind).record(duration);
+            metrics::counter!(
+                "db_requests_total",
+                "kind" => kind,
+                "status" => if success { "ok" } else { "error" },
+            )
+            .increment(1);
         })
         .await
         .map_err(|_| AppError::Internal("DB task panicked".into()))?;
@@ -200,10 +236,12 @@ impl DbHandle {
             let cache = self.cache.read().await;
             if let Some((ref data, ts)) = cache.tags {
                 if ts.elapsed() < SIDEBAR_CACHE_TTL {
+                    metrics::counter!("db_cache_hits_total", "kind" => "tags").increment(1);
                     return Ok(data.clone());
                 }
             }
         }
+        metrics::counter!("db_cache_misses_total", "kind" => "tags").increment(1);
         let result = self.request(|tx| DbRequest::Tags { respond: tx }).await?;
         {
             let mut cache = self.cache.write().await;
@@ -218,10 +256,12 @@ impl DbHandle {
             let cache = self.cache.read().await;
             if let Some((ref data, ts)) = cache.stats {
                 if ts.elapsed() < SIDEBAR_CACHE_TTL {
+                    metrics::counter!("db_cache_hits_total", "kind" => "stats").increment(1);
                     return Ok(data.clone());
                 }
             }
         }
+        metrics::counter!("db_cache_misses_total", "kind" => "stats").increment(1);
         let result = self.request(|tx| DbRequest::Stats { respond: tx }).await?;
         {
             let mut cache = self.cache.write().await;
@@ -236,10 +276,12 @@ impl DbHandle {
             let cache = self.cache.read().await;
             if let Some((ref data, ts)) = cache.senders {
                 if ts.elapsed() < SIDEBAR_CACHE_TTL {
+                    metrics::counter!("db_cache_hits_total", "kind" => "senders").increment(1);
                     return Ok(data.clone());
                 }
             }
         }
+        metrics::counter!("db_cache_misses_total", "kind" => "senders").increment(1);
         let result = self
             .request(|tx| DbRequest::Senders { respond: tx })
             .await?;
@@ -490,7 +532,7 @@ pub fn find_message_bytes(db: &notmuch::Database, msg_id: &str) -> Result<Vec<u8
         .next()
         .ok_or_else(|| AppError::NotFound(format!("message not found: {msg_id}")))?;
     let filename = msg.filename();
-    std::fs::read(&filename).map_err(|e| {
+    std::fs::read(filename).map_err(|e| {
         AppError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to read {}: {e}", filename.display()),

@@ -60,6 +60,10 @@ schemars = "1.0"
 tokio-util = { version = "0.7", features = ["rt"] }
 base64 = "0.22"
 
+# Metrics (Prometheus text format)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
 # Document text extraction
 batdoc-core = { git = "https://github.com/daemonp/batdoc" }
 

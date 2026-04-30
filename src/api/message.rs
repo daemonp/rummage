@@ -85,7 +85,7 @@ pub fn do_message_detail(
     let thread_id = msg.thread_id().to_string();
 
     let filename = msg.filename();
-    let bytes = std::fs::read(&filename).map_err(|e| {
+    let bytes = std::fs::read(filename).map_err(|e| {
         AppError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to read {}: {e}", filename.display()),

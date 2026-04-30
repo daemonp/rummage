@@ -21,7 +21,7 @@ pub fn extract_message(msg: &Message) -> Result<MessageDetail> {
     let tags: Vec<String> = msg.tags().collect();
 
     let filename = msg.filename();
-    let raw = std::fs::read(&filename).map_err(|e| {
+    let raw = std::fs::read(filename).map_err(|e| {
         AppError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to read {}: {e}", filename.display()),

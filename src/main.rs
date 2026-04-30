@@ -63,6 +63,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
             .unwrap_or(true);
     let webui_enabled = !config.no_webui;
 
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("Failed to install Prometheus metrics recorder: {e}"))?;
+    server::set_metrics_handle(prometheus_handle);
+
     info!(
         "Starting server on http://{}:{} (local only)",
         config.host, config.port
