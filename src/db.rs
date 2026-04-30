@@ -701,9 +701,17 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
     info!("Walking maildir for indexing...");
     let start = std::time::Instant::now();
 
+    // Prevent Xapian's internal auto-flush from fighting with our batching.
+    std::env::set_var("XAPIAN_FLUSH_THRESHOLD", "1000000");
+
     let mut indexed = 0usize;
     let mut last_reported = 0usize;
     const REPORT_INTERVAL: usize = 1_000;
+
+    let atomic_ok = db.begin_atomic().is_ok();
+    if !atomic_ok {
+        warn!("begin_atomic failed; falling back to unbatched indexing");
+    }
 
     for entry in walkdir::WalkDir::new(maildir)
         .into_iter()
@@ -728,6 +736,15 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
                 }
             }
         }
+    }
+
+    if atomic_ok {
+        if let Err(e) = db.end_atomic() {
+            warn!("end_atomic failed: {e}");
+        }
+    }
+    if let Err(e) = db.close() {
+        warn!("Final close failed: {e}");
     }
 
     info!(
@@ -1033,5 +1050,22 @@ mod perf_tests {
             "search + cached sidebar took too long: {:?}",
             elapsed
         );
+    }
+
+    /// Benchmark a full reindex of the test archive.
+    /// Run in isolation: `cargo test perf_index_full_reindex -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_index_full_reindex() {
+        let Some((maildir, config)) = test_maildir() else {
+            return;
+        };
+        let db_path = maildir.join(".notmuch");
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let start = Instant::now();
+        force_reindex(&maildir, config.as_deref()).expect("reindex");
+        let elapsed = start.elapsed();
+        println!("Full reindex of test archive -> {elapsed:?}");
     }
 }
