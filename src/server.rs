@@ -48,6 +48,7 @@ pub struct RouterConfig {
     pub webui_enabled: bool,
     pub mcp_enabled: bool,
     pub mcp_path: String,
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Extract the theme preference from the Cookie header.
@@ -233,10 +234,12 @@ async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
 
         let db_for_mcp = db.clone();
         let mcp_handler = crate::mcp::RummageMcpHandler::new(db_for_mcp).await;
+        let mcp_config = StreamableHttpServerConfig::default()
+            .with_allowed_hosts(router_config.mcp_allowed_hosts.iter().map(|s| s.as_str()));
         let mcp_service = StreamableHttpService::new(
             move || Ok(mcp_handler.clone()),
             LocalSessionManager::default().into(),
-            StreamableHttpServerConfig::default(),
+            mcp_config,
         );
 
         router = router.nest_service(&router_config.mcp_path, mcp_service);

@@ -77,6 +77,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         webui_enabled,
         mcp_enabled,
         mcp_path: config.mcp_path.clone(),
+        mcp_allowed_hosts: config.mcp_allowed_hosts.clone(),
     };
 
     server::serve(db_handle, &config, router_config).await?;

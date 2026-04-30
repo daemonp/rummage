@@ -42,4 +42,13 @@ pub struct Config {
     /// Custom mount point for MCP transport
     #[arg(long, default_value = "/mcp", env = "RUMMAGE_MCP_PATH")]
     pub mcp_path: String,
+
+    /// Allowed Host headers for MCP DNS rebinding protection (default: localhost,127.0.0.1,::1)
+    #[arg(
+        long,
+        env = "RUMMAGE_MCP_ALLOWED_HOSTS",
+        value_delimiter = ',',
+        default_value = "localhost,127.0.0.1,::1"
+    )]
+    pub mcp_allowed_hosts: Vec<String>,
 }
