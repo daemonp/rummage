@@ -734,32 +734,81 @@ fn index_maildir(db: &notmuch::Database, maildir: &Path) {
 
     info!("Found {} candidate files to index", files.len());
 
-    // ── Phase 2: index in batches ─────────────────────────────────────
-    // Wrap each batch in begin_atomic/end_atomic so Xapian flushes on our
-    // schedule, not its own.  This turns the spiky sawtooth (auto-commit
-    // every 10k docs) into a sustained disk workload.
-    const BATCH_SIZE: usize = 10_000;
-    let mut batch_start = 0usize;
-    while batch_start < files.len() {
-        let batch_end = (batch_start + BATCH_SIZE).min(files.len());
-        let _ = db.begin_atomic();
-        for path in &files[batch_start..batch_end] {
-            if let Err(e) = db.index_file(path, None) {
-                warn!("Failed to index {path:?}: {e}");
-                errors += 1;
-            } else {
-                indexed += 1;
-                if indexed - last_reported >= 1_000 {
-                    let rate = indexing_rate(indexed, &start);
-                    info!("Indexed {} messages ({:.0} msg/s)...", indexed, rate);
-                    metrics::gauge!("indexing_rate").set(rate);
-                    last_reported = indexed;
+    // ── Phase 2: warm VFS page cache in parallel, then index ──────────
+    // When maildir lives on NFS, every open/read/close in notmuch is an RPC
+    // round-trip.  We keep the files at their real paths (notmuch rejects
+    // out-of-tree files), but run cache-warming threads ~2 k files ahead
+    // of the indexer so the kernel page cache hides the latency.
+    const PREFETCH_WORKERS: usize = 8;
+    const PREFETCH_AHEAD: usize = 2_000;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let prefetch_idx = AtomicUsize::new(0);
+    let index_idx = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        // Cache-warming workers: simple blocking reads, no allocation churn.
+        for _ in 0..PREFETCH_WORKERS {
+            s.spawn(|| {
+                use std::io::Read;
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let idx = prefetch_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    // Stay bounded so the kernel LRU doesn't evict what we
+                    // warmed five minutes ago.
+                    loop {
+                        let current = index_idx.load(Ordering::Relaxed);
+                        if idx < current + PREFETCH_AHEAD || current >= files.len() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    if let Ok(mut f) = std::fs::File::open(&files[idx]) {
+                        loop {
+                            match f.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── Phase 3: index in batches ───────────────────────────────
+        // Wrap each batch in begin_atomic/end_atomic so Xapian flushes on
+        // our schedule, not its own.
+        const BATCH_SIZE: usize = 10_000;
+        let mut batch_start = 0usize;
+        while batch_start < files.len() {
+            let batch_end = (batch_start + BATCH_SIZE).min(files.len());
+            if let Err(e) = db.begin_atomic() {
+                warn!("begin_atomic failed: {e}; indexing batch without transaction");
+            }
+            for (offset, path) in files[batch_start..batch_end].iter().enumerate() {
+                index_idx.store(batch_start + offset, Ordering::Relaxed);
+                if let Err(e) = db.index_file(path, None) {
+                    warn!("Failed to index {path:?}: {e}");
+                    errors += 1;
+                } else {
+                    indexed += 1;
+                    if indexed - last_reported >= 1_000 {
+                        let rate = indexing_rate(indexed, &start);
+                        info!("Indexed {} messages ({:.0} msg/s)...", indexed, rate);
+                        metrics::gauge!("indexing_rate").set(rate);
+                        last_reported = indexed;
+                    }
                 }
             }
+            if let Err(e) = db.end_atomic() {
+                warn!("end_atomic failed: {e}; batch changes may not be committed");
+            }
+            batch_start = batch_end;
         }
-        let _ = db.end_atomic();
-        batch_start = batch_end;
-    }
+    });
 
     if let Err(e) = db.close() {
         warn!("Final close failed: {e}");
