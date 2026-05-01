@@ -23,14 +23,12 @@ pub async fn handler(
 ) -> Result<impl IntoResponse> {
     let data = db.attachment(params.msg, params.part).await?;
 
-    // Use Content-Disposition: inline for types that can render in the browser
-    // (PDFs, images, text, video), and "attachment" for everything else.
+    // Validate the content type before allowing inline display.
+    // The type declared in the email MIME headers is untrusted — a malicious
+    // sender could label executable content as "text/html" to trick the
+    // browser into rendering it in our origin. We whitelist only safe types.
     let ct = &data.content_type;
-    let disposition = if ct.starts_with("image/")
-        || ct.starts_with("text/")
-        || ct.starts_with("video/")
-        || ct == "application/pdf"
-    {
+    let disposition = if is_safe_inline(ct) {
         "inline"
     } else {
         "attachment"
@@ -57,6 +55,17 @@ pub async fn handler(
     Ok(response)
 }
 
+/// Return true for MIME types that browsers can safely render inline.
+///
+/// `text/plain` is allowed; `text/html` and other `text/*` types are not,
+/// because they may contain executable JavaScript when served from our origin.
+fn is_safe_inline(ct: &str) -> bool {
+    ct.starts_with("image/")
+        || ct.starts_with("video/")
+        || ct == "text/plain"
+        || ct == "application/pdf"
+}
+
 /// Synchronous attachment extraction against an open notmuch `Database`.
 ///
 /// # Errors
@@ -74,6 +83,45 @@ pub fn do_attachment(
         body,
         filename,
     })
+}
+
+/// Query parameters for the attachment text endpoint.
+#[derive(Debug, Deserialize)]
+pub struct AttachmentTextParams {
+    pub msg: String,
+    pub part: usize,
+    pub format: Option<String>,
+}
+
+/// Extract readable text from an email attachment by message ID and part number.
+///
+/// Uses `batdoc-core` for binary formats (PDF, DOCX, XLSX, etc.) and direct
+/// UTF-8 decoding for text-based ones.
+///
+/// # Errors
+/// Returns `AppError::NotFound` if the message or part does not exist,
+/// or `AppError::Internal` if text extraction fails.
+pub async fn text_handler(
+    State(db): State<DbHandle>,
+    Query(params): Query<AttachmentTextParams>,
+) -> Result<impl IntoResponse> {
+    let format = params.format.as_deref().unwrap_or("text");
+    let text = db
+        .attachment_text(params.msg.clone(), params.part, format.to_string())
+        .await?;
+
+    let ct = if format == "markdown" {
+        "text/markdown; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+
+    let response = axum::http::Response::builder()
+        .header("Content-Type", ct)
+        .body(Body::from(text))
+        .map_err(|e| AppError::Internal(format!("response build error: {e}")))?;
+
+    Ok(response)
 }
 
 /// Extract readable text from an attachment using `batdoc-core` for binary

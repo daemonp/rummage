@@ -210,6 +210,7 @@ async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
         .route("/api/search", get(api::search::handler))
         .route("/api/thread/:id", get(api::thread::handler))
         .route("/api/attachment", get(api::attachment::handler))
+        .route("/api/attachment/text", get(api::attachment::text_handler))
         .route("/api/message/:id", get(api::message::handler))
         .route("/api/tags", get(api::tags::handler))
         .route("/api/stats", get(api::stats::handler))

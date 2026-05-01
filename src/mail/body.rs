@@ -1,6 +1,7 @@
 use ammonia::Builder;
 use linkify::{LinkFinder, LinkKind};
 use regex::Regex;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::LazyLock;
 
@@ -68,6 +69,10 @@ pub fn sanitize_html(raw: &str) -> String {
             .cloned()
             .collect(),
         )
+        // Harden against malicious URLs (javascript:, data:, vbscript:, etc.).
+        // Ammonia strips dangerous schemes by default, but we replace the broad
+        // default whitelist with an explicit minimal set for defense in depth.
+        .url_schemes(HashSet::from(["http", "https", "mailto", "cid"]))
         .url_relative(ammonia::UrlRelative::PassThrough)
         .clean(raw)
         .to_string()
