@@ -16,6 +16,7 @@ use axum::Router;
 use dioxus::prelude::*;
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 use tower_http::trace::TraceLayer;
@@ -236,9 +237,11 @@ async fn router(db: DbHandle, router_config: RouterConfig) -> Router {
         let mcp_handler = crate::mcp::RummageMcpHandler::new(db_for_mcp).await;
         let mcp_config = StreamableHttpServerConfig::default()
             .with_allowed_hosts(router_config.mcp_allowed_hosts.iter().map(|s| s.as_str()));
+        let mut session_manager = LocalSessionManager::default();
+        session_manager.session_config.keep_alive = None;
         let mcp_service = StreamableHttpService::new(
             move || Ok(mcp_handler.clone()),
-            LocalSessionManager::default().into(),
+            Arc::new(session_manager),
             mcp_config,
         );
 
